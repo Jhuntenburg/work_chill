@@ -1,0 +1,984 @@
+#!/usr/bin/env bash
+
+set -u
+
+DATA_DIR="${HOME}/.work_chill"
+STATE_FILE="${DATA_DIR}/state.sh"
+LOG_FILE="${DATA_DIR}/log.jsonl"
+BG_LOG_FILE="${DATA_DIR}/bg.log"
+SCRIPT_PATH=""
+
+DEFAULT_MEDITATION_URL="https://youtu.be/7CaaHXjoRhA?si=LMDnR8tb5zmGMRV-"
+
+day_start_ts=""
+prompt_pid=""
+eod_pid=""
+meditation_url="$DEFAULT_MEDITATION_URL"
+last_task_text=""
+last_prompt_ts=""
+
+is_test_mode() {
+  [[ "${WORK_CHILL_TEST:-0}" == "1" ]]
+}
+
+prompt_interval_sec() {
+  if is_test_mode; then
+    printf '10'
+  else
+    printf '3300'
+  fi
+}
+
+day_length_sec() {
+  if is_test_mode; then
+    printf '120'
+  else
+    printf '28800'
+  fi
+}
+
+is_valid_hhmm() {
+  local hhmm="${1:-}"
+  [[ "$hhmm" =~ ^([01][0-9]|2[0-3]):([0-5][0-9])$ ]]
+}
+
+seconds_until_end_at() {
+  local hhmm="${1:-}"
+  local now=""
+  local today=""
+  local target=""
+
+  is_valid_hhmm "$hhmm" || return 1
+
+  now="$(date +%s)"
+  today="$(date +"%Y-%m-%d")"
+  target="$(date -j -f "%Y-%m-%d %H:%M" "$today $hhmm" +%s 2>/dev/null || true)"
+  [[ -n "$target" ]] || return 1
+
+  if (( target <= now )); then
+    target="$(date -j -v+1d -f "%Y-%m-%d %H:%M" "$today $hhmm" +%s 2>/dev/null || true)"
+    [[ -n "$target" ]] || return 1
+  fi
+
+  printf '%s' "$((target - now))"
+}
+
+meditation_timer_sec() {
+  if is_test_mode; then
+    printf '15'
+  else
+    printf '360'
+  fi
+}
+
+resolve_script_path() {
+  local src="${BASH_SOURCE[0]:-$0}"
+  local resolved=""
+  if [[ "$src" = /* ]]; then
+    resolved="$src"
+  else
+    resolved="$(command -v "$src" 2>/dev/null || true)"
+    if [[ -z "$resolved" ]]; then
+      resolved="$(cd "$(dirname "$src")" && pwd -P)/$(basename "$src")"
+    fi
+  fi
+  printf '%s' "$resolved"
+}
+
+pulse_dialog_timeout_sec() {
+  if is_test_mode; then
+    printf '5'
+  else
+    printf '45'
+  fi
+}
+
+shutdown_input_timeout_sec() {
+  if is_test_mode; then
+    printf '5'
+  else
+    printf '180'
+  fi
+}
+
+confirm_timeout_sec() {
+  if is_test_mode; then
+    printf '3'
+  else
+    printf '45'
+  fi
+}
+
+iso_ts() {
+  date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+json_escape() {
+  local s="${1:-}"
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  s=${s//$'\t'/\\t}
+  printf '%s' "$s"
+}
+
+ensure_data_dir() {
+  mkdir -p "$DATA_DIR"
+  touch "$STATE_FILE" "$LOG_FILE" "$BG_LOG_FILE"
+  chmod 600 "$STATE_FILE" "$LOG_FILE" "$BG_LOG_FILE" 2>/dev/null || true
+}
+
+save_state() {
+  ensure_data_dir
+  {
+    printf 'export day_start_ts=%q\n' "${day_start_ts:-}"
+    printf 'export prompt_pid=%q\n' "${prompt_pid:-}"
+    printf 'export eod_pid=%q\n' "${eod_pid:-}"
+    printf 'export meditation_url=%q\n' "${meditation_url:-}"
+    printf 'export last_task_text=%q\n' "${last_task_text:-}"
+    printf 'export last_prompt_ts=%q\n' "${last_prompt_ts:-}"
+  } > "$STATE_FILE"
+}
+
+load_state() {
+  day_start_ts=""
+  prompt_pid=""
+  eod_pid=""
+  meditation_url="$DEFAULT_MEDITATION_URL"
+  last_task_text=""
+  last_prompt_ts=""
+
+  if [[ -f "$STATE_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$STATE_FILE"
+  fi
+}
+
+log_event() {
+  local event="${1:-}"
+  local action="${2:-}"
+  local task_text="${3:-}"
+  local tomorrow_first_step="${4:-}"
+  local open_items="${5:-}"
+  local json=""
+
+  ensure_data_dir
+  json='{'
+  json+="$(log_json_kv "ts" "$(iso_ts)")"
+  json+=",$(log_json_kv "event" "$event")"
+  json+=",$(log_json_kv "action" "$action")"
+
+  case "$event" in
+    "DAY_START")
+      json+=",$(log_json_kv "day_start_ts" "${day_start_ts:-}")"
+      ;;
+    "TASK_PULSE")
+      json+=",$(log_json_kv "task_text" "$task_text")"
+      json+=",$(log_json_kv "day_start_ts" "${day_start_ts:-}")"
+      ;;
+    "TASK_PULSE_SKIPPED")
+      json+=",$(log_json_kv "day_start_ts" "${day_start_ts:-}")"
+      ;;
+    "SHUTDOWN")
+      json+=",$(log_json_kv "task_text" "$task_text")"
+      json+=",$(log_json_kv "day_start_ts" "${day_start_ts:-}")"
+      json+=",$(log_json_kv "tomorrow_first_step" "$tomorrow_first_step")"
+      json+=",$(log_json_kv "open_items" "$open_items")"
+      ;;
+    "CANCEL")
+      ;;
+    *)
+      if [[ -n "$task_text" ]]; then
+        json+=",$(log_json_kv "task_text" "$task_text")"
+      fi
+      if [[ -n "${day_start_ts:-}" ]]; then
+        json+=",$(log_json_kv "day_start_ts" "${day_start_ts:-}")"
+      fi
+      if [[ -n "$tomorrow_first_step" ]]; then
+        json+=",$(log_json_kv "tomorrow_first_step" "$tomorrow_first_step")"
+      fi
+      if [[ -n "$open_items" ]]; then
+        json+=",$(log_json_kv "open_items" "$open_items")"
+      fi
+      ;;
+  esac
+
+  json+='}'
+  printf '%s\n' "$json" >> "$LOG_FILE"
+}
+
+log_json_kv() {
+  local key="${1:-}"
+  local value="${2:-}"
+  printf '"%s":"%s"' "$(json_escape "$key")" "$(json_escape "$value")"
+}
+
+pid_alive() {
+  local pid="${1:-}"
+  [[ -n "$pid" && "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+pid_looks_like_work_chill() {
+  local pid="${1:-}"
+  local marker="${2:-}"
+  local cmd=""
+  pid_alive "$pid" || return 1
+  cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  [[ "$cmd" == *"work_chill"* && "$cmd" == *"$marker"* ]]
+}
+
+kill_pid_if_ours() {
+  local pid="${1:-}"
+  local marker="${2:-}"
+  [[ -n "$pid" ]] || return 0
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+  [[ "$pid" != "$$" ]] || return 0
+
+  if pid_looks_like_work_chill "$pid" "$marker"; then
+    kill "$pid" 2>/dev/null || true
+    sleep 0.1
+    if pid_alive "$pid"; then
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+  fi
+}
+
+cancel_jobs_only() {
+  load_state
+  kill_pid_if_ours "${prompt_pid:-}" "__prompt-loop"
+  kill_pid_if_ours "${eod_pid:-}" "__eod-wait"
+  prompt_pid=""
+  eod_pid=""
+}
+
+reset_active_day_state() {
+  day_start_ts=""
+  prompt_pid=""
+  eod_pid=""
+  last_prompt_ts=""
+}
+
+resolve_button_from_osascript_output() {
+  local out="${1:-}"
+  printf '%s' "$out" | sed -n 's/^button returned://p'
+}
+
+prompt_action_osascript() {
+  local out=""
+  local parsed=""
+  local rc=0
+  local timeout
+  local tmp_err=""
+  local stderr_text=""
+  timeout="$(pulse_dialog_timeout_sec)"
+  tmp_err="$(mktemp "${TMPDIR:-/tmp}/work_chill_prompt.XXXXXX")"
+  out="$(osascript <<APPLESCRIPT 2>"$tmp_err"
+activate
+set d to display dialog "What are you on right now?" with title "Friction Check" buttons {"Same as last", "New task", "Stuck"} default button "Same as last" giving up after $timeout
+if gave up of d then return "Skip"
+return button returned of d
+APPLESCRIPT
+)"
+  rc=$?
+  stderr_text="$(single_line "$(cat "$tmp_err" 2>/dev/null || true)")"
+  rm -f "$tmp_err"
+
+  bg_log "prompt_dialog rc=$rc output=\"$(single_line "$out")\" stderr=\"$stderr_text\""
+
+  if [[ "$rc" -ne 0 ]]; then
+    if [[ "$stderr_text" == *"(-128)"* ]]; then
+      bg_log "prompt_dialog_canceled treated_as=\"Skip\""
+      printf 'Skip'
+      return 0
+    fi
+    notify_message "Friction Check prompt failed. Defaulting to Skip." "Work Chill"
+    bg_log "prompt_dialog_fallback notification_sent=1 reason=\"osascript_failed\""
+    return 1
+  fi
+
+  parsed="$out"
+  if [[ "$parsed" != "Skip" && "$parsed" != "Same as last" && "$parsed" != "New task" && "$parsed" != "Stuck" ]]; then
+    parsed="$(resolve_button_from_osascript_output "$out")"
+  fi
+
+  if [[ "$parsed" == "Skip" || "$parsed" == "Same as last" || "$parsed" == "New task" || "$parsed" == "Stuck" ]]; then
+    printf '%s' "$parsed"
+    return 0
+  fi
+
+  notify_message "Friction Check prompt response was invalid. Defaulting to Skip." "Work Chill"
+  bg_log "prompt_dialog_fallback notification_sent=1 reason=\"unexpected_output\""
+  return 1
+}
+
+prompt_action_terminal() {
+  local choice=""
+  printf '\nFriction Check\n'
+  printf 'What are you on right now?\n'
+  printf '1) Same as last\n'
+  printf '2) New task\n'
+  printf '3) Stuck\n'
+  printf '4) Skip\n'
+  printf 'Choose [1-4]: '
+  IFS= read -r choice
+  case "$choice" in
+    1) printf 'Same as last' ;;
+    2) printf 'New task' ;;
+    3) printf 'Stuck' ;;
+    *) printf 'Skip' ;;
+  esac
+}
+
+get_action_choice() {
+  local action=""
+  action="$(prompt_action_osascript || true)"
+  if [[ -n "$action" ]]; then
+    printf '%s' "$action"
+    return 0
+  fi
+
+  if [[ -t 0 ]]; then
+    bg_log "prompt_dialog_fallback mode=\"terminal\""
+    prompt_action_terminal
+  else
+    bg_log "prompt_dialog_fallback mode=\"skip_no_tty\""
+    printf 'Skip'
+  fi
+}
+
+text_input_osascript() {
+  local prompt="${1:-}"
+  local title="${2:-Work Chill}"
+  local timeout
+  timeout="$(shutdown_input_timeout_sec)"
+  osascript <<APPLESCRIPT 2>/dev/null
+set d to display dialog "$(printf '%s' "$prompt" | sed 's/"/\\"/g')" with title "$(printf '%s' "$title" | sed 's/"/\\"/g')" default answer "" buttons {"Cancel", "OK"} default button "OK" giving up after $timeout
+if gave up of d then return ""
+text returned of d
+APPLESCRIPT
+}
+
+text_input_terminal() {
+  local prompt="${1:-}"
+  local value=""
+  printf '%s ' "$prompt"
+  IFS= read -r value
+  printf '%s' "$value"
+}
+
+get_text_input() {
+  local prompt="${1:-}"
+  local title="${2:-Work Chill}"
+  local value=""
+  value="$(text_input_osascript "$prompt" "$title" || true)"
+  if [[ -n "$value" ]]; then
+    printf '%s' "$value"
+    return 0
+  fi
+  if [[ -t 0 ]]; then
+    text_input_terminal "$prompt"
+    return 0
+  fi
+  printf ''
+}
+
+confirm_ok() {
+  local message="${1:-}"
+  local title="${2:-Work Chill}"
+  local timeout
+  timeout="$(confirm_timeout_sec)"
+  if ! osascript <<APPLESCRIPT >/dev/null 2>&1
+display dialog "$(printf '%s' "$message" | sed 's/"/\\"/g')" with title "$(printf '%s' "$title" | sed 's/"/\\"/g')" buttons {"OK"} default button "OK" giving up after $timeout
+APPLESCRIPT
+  then
+    if [[ -t 0 ]]; then
+      printf '%s\nPress Enter to continue...' "$message"
+      read -r _
+    fi
+  fi
+}
+
+notify_message() {
+  local message="${1:-}"
+  local title="${2:-Work Chill}"
+  osascript -e "display notification \"$(printf '%s' "$message" | sed 's/"/\\"/g')\" with title \"$(printf '%s' "$title" | sed 's/"/\\"/g')\"" >/dev/null 2>&1 || true
+}
+
+single_line() {
+  local s="${1:-}"
+  printf '%s' "$s" | tr '\n\r\t' '   ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//'
+}
+
+bg_log() {
+  local message="${1:-}"
+  ensure_data_dir
+  printf '%s %s\n' "$(iso_ts)" "$(single_line "$message")" >> "$BG_LOG_FILE" 2>/dev/null || true
+}
+
+json_unescape_best_effort() {
+  local s="${1:-}"
+  s="${s//\\\"/\"}"
+  s="${s//\\\\/\\}"
+  printf '%s' "$s"
+}
+
+extract_json_field_between() {
+  local line="${1:-}"
+  local start="${2:-}"
+  local end="${3:-}"
+  local value=""
+  [[ -n "$line" && -n "$start" && -n "$end" ]] || return 1
+  [[ "$line" == *"$start"* ]] || return 1
+  value="${line#*"$start"}"
+  value="${value%%"$end"*}"
+  printf '%s' "$value"
+}
+
+latest_shutdown_log_line() {
+  local line=""
+  [[ -f "$LOG_FILE" ]] || return 1
+
+  line="$(tail -r "$LOG_FILE" 2>/dev/null | grep -m 1 '"event":"SHUTDOWN"' || true)"
+  if [[ -z "$line" ]] && command -v tac >/dev/null 2>&1; then
+    line="$(tac "$LOG_FILE" 2>/dev/null | grep -m 1 '"event":"SHUTDOWN"' || true)"
+  fi
+  if [[ -z "$line" ]]; then
+    line="$(grep '"event":"SHUTDOWN"' "$LOG_FILE" 2>/dev/null | tail -n 1 || true)"
+  fi
+
+  [[ -n "$line" ]] || return 1
+  printf '%s' "$line"
+}
+
+parse_shutdown_context_from_line() {
+  local line="${1:-}"
+  local parsed=""
+  last_shutdown_ts=""
+  last_shutdown_task_text=""
+  last_shutdown_tomorrow_first_step=""
+  last_shutdown_open_items=""
+
+  [[ -n "$line" ]] || return 1
+
+  if command -v jq >/dev/null 2>&1; then
+    parsed="$(printf '%s\n' "$line" | jq -r '[.ts // "", .task_text // "", .tomorrow_first_step // "", .open_items // ""] | @tsv' 2>/dev/null || true)"
+    if [[ -n "$parsed" ]]; then
+      IFS=$'\t' read -r last_shutdown_ts last_shutdown_task_text last_shutdown_tomorrow_first_step last_shutdown_open_items <<< "$parsed"
+      return 0
+    fi
+  fi
+
+  last_shutdown_ts="$(extract_json_field_between "$line" '"ts":"' '","event":"' || true)"
+  last_shutdown_task_text="$(extract_json_field_between "$line" '"task_text":"' '","day_start_ts":"' || true)"
+  last_shutdown_tomorrow_first_step="$(extract_json_field_between "$line" '"tomorrow_first_step":"' '","open_items":"' || true)"
+  last_shutdown_open_items="$(extract_json_field_between "$line" '"open_items":"' '"}' || true)"
+
+  last_shutdown_ts="$(json_unescape_best_effort "$last_shutdown_ts")"
+  last_shutdown_task_text="$(json_unescape_best_effort "$last_shutdown_task_text")"
+  last_shutdown_tomorrow_first_step="$(json_unescape_best_effort "$last_shutdown_tomorrow_first_step")"
+  last_shutdown_open_items="$(json_unescape_best_effort "$last_shutdown_open_items")"
+
+  return 0
+}
+
+append_welcome_section() {
+  local header="${1:-}"
+  local body="${2:-}"
+  local current="${3:-}"
+  local next=""
+
+  if [[ -z "$body" ]]; then
+    printf '%s' "$current"
+    return 0
+  fi
+
+  next="$current"
+  if [[ -n "$next" ]]; then
+    next+=$'\n\n'
+  fi
+  next+="$header"
+  next+=$'\n'
+  next+="$body"
+  printf '%s' "$next"
+}
+
+show_welcome_back_summary() {
+  local line=""
+  local message=""
+  local timeout=45
+  local escaped=""
+
+  if ! line="$(latest_shutdown_log_line)"; then
+    message="Welcome - no prior shutdown context found."
+  else
+    parse_shutdown_context_from_line "$line" || true
+    message="$(append_welcome_section "Yesterday you closed with:" "${last_shutdown_task_text:-}" "$message")"
+    message="$(append_welcome_section "Next step you planned:" "${last_shutdown_tomorrow_first_step:-}" "$message")"
+    message="$(append_welcome_section "Open loop parked:" "${last_shutdown_open_items:-}" "$message")"
+    if [[ -z "$message" ]]; then
+      message="Welcome back. Last shutdown context was empty."
+      if [[ -n "${last_shutdown_ts:-}" ]]; then
+        message="$message"$'\n'"Last shutdown timestamp: ${last_shutdown_ts}"
+      fi
+    fi
+  fi
+
+  escaped="$(printf '%s' "$message" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+  if command -v osascript >/dev/null 2>&1; then
+    if osascript <<APPLESCRIPT >/dev/null 2>&1
+display dialog "$escaped" with title "Welcome back" buttons {"OK"} default button "OK" giving up after $timeout
+APPLESCRIPT
+    then
+      return 0
+    fi
+  fi
+
+  printf '\n[Welcome back]\n%s\n\n' "$message"
+  return 1
+}
+
+run_task_pulse() {
+  load_state
+  local action=""
+  local task_text=""
+
+  action="$(get_action_choice)"
+  case "$action" in
+    "Same as last")
+      task_text="${last_task_text:-}"
+      if [[ -z "$task_text" ]]; then
+        task_text="$(get_text_input "Enter current task:" "Friction Check")"
+      fi
+      last_task_text="$task_text"
+      last_prompt_ts="$(date +%s)"
+      save_state
+      log_event "TASK_PULSE" "same_as_last" "$task_text" "" ""
+      ;;
+    "New task")
+      task_text="$(get_text_input "Enter current task:" "Friction Check")"
+      last_task_text="$task_text"
+      last_prompt_ts="$(date +%s)"
+      save_state
+      log_event "TASK_PULSE" "new_task" "$task_text" "" ""
+      ;;
+    "Stuck")
+      task_text="${last_task_text:-}"
+      if [[ -z "$task_text" ]]; then
+        task_text="$(get_text_input "Enter current task:" "Friction Check")"
+      fi
+      last_task_text="$task_text"
+      last_prompt_ts="$(date +%s)"
+      save_state
+      log_event "TASK_PULSE" "stuck" "$task_text" "" ""
+      ;;
+    *)
+      last_prompt_ts="$(date +%s)"
+      save_state
+      log_event "TASK_PULSE_SKIPPED" "skip" "" "" ""
+      ;;
+  esac
+}
+
+start_prompt_loop_bg() {
+  local start_ts="${1:-}"
+  nohup "$SCRIPT_PATH" __prompt-loop "$start_ts" >> "$BG_LOG_FILE" 2>&1 &
+  prompt_pid="$!"
+  disown "$prompt_pid" 2>/dev/null || true
+}
+
+start_eod_bg() {
+  local start_ts="${1:-}"
+  local length="${2:-}"
+  if [[ -z "$length" ]]; then
+    length="$(day_length_sec)"
+  fi
+  nohup "$SCRIPT_PATH" __eod-wait "$start_ts" "$length" >> "$BG_LOG_FILE" 2>&1 &
+  eod_pid="$!"
+  disown "$eod_pid" 2>/dev/null || true
+}
+
+run_start() {
+  local end_at=""
+  local eod_wait=""
+
+  while [[ "$#" -gt 0 ]]; do
+    case "${1:-}" in
+      --end-at)
+        if [[ "$#" -lt 2 || -z "${2:-}" ]]; then
+          printf 'Usage: work_chill start [--end-at HH:MM]\n' >&2
+          exit 1
+        fi
+        end_at="$2"
+        shift 2
+        ;;
+      --end-at=*)
+        end_at="${1#*=}"
+        shift
+        ;;
+      *)
+        printf 'Usage: work_chill start [--end-at HH:MM]\n' >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  if [[ -n "$end_at" ]]; then
+    if ! is_valid_hhmm "$end_at"; then
+      printf 'Invalid --end-at value: %s (expected HH:MM, 24-hour)\n' "$end_at" >&2
+      exit 1
+    fi
+    eod_wait="$(seconds_until_end_at "$end_at" || true)"
+    if [[ -z "$eod_wait" || "$eod_wait" -le 0 ]]; then
+      printf 'Unable to schedule end-of-day for %s\n' "$end_at" >&2
+      exit 1
+    fi
+  else
+    eod_wait="$(day_length_sec)"
+  fi
+
+  ensure_data_dir
+  load_state
+
+  if [[ -n "${day_start_ts:-}" ]]; then
+    cancel_jobs_only
+  fi
+
+  show_welcome_back_summary || true
+
+  day_start_ts="$(date +%s)"
+  last_prompt_ts=""
+  save_state
+
+  start_prompt_loop_bg "$day_start_ts"
+  start_eod_bg "$day_start_ts" "$eod_wait"
+  save_state
+
+  log_event "DAY_START" "start" "" "" ""
+
+  printf 'Work day started at %s\n' "$(date -r "$day_start_ts" +"%Y-%m-%d %H:%M:%S")"
+  if [[ -n "$end_at" ]]; then
+    printf 'End-of-day scheduled for %s (in %s seconds)\n' "$end_at" "$eod_wait"
+  fi
+  if is_test_mode; then
+    printf 'TEST MODE: prompt interval=10s, day length=2m, meditation timer=15s\n'
+  fi
+}
+
+format_elapsed() {
+  local secs="${1:-0}"
+  local h m s
+  h=$((secs / 3600))
+  m=$(( (secs % 3600) / 60 ))
+  s=$((secs % 60))
+  printf '%02dh %02dm %02ds' "$h" "$m" "$s"
+}
+
+status_line_pid() {
+  local label="${1:-}"
+  local pid="${2:-}"
+  local marker="${3:-}"
+  if pid_looks_like_work_chill "$pid" "$marker"; then
+    printf '%s: %s (alive)\n' "$label" "$pid"
+  elif pid_alive "$pid"; then
+    printf '%s: %s (alive, non-matching cmd)\n' "$label" "$pid"
+  else
+    printf '%s: %s (not running)\n' "$label" "${pid:-<none>}"
+  fi
+}
+
+run_status() {
+  load_state
+  local now elapsed active
+  now="$(date +%s)"
+
+  if [[ -n "${day_start_ts:-}" ]]; then
+    elapsed=$((now - day_start_ts))
+    active="yes"
+    printf 'day_active: %s\n' "$active"
+    printf 'start_time: %s\n' "$(date -r "$day_start_ts" +"%Y-%m-%d %H:%M:%S")"
+    printf 'elapsed: %s\n' "$(format_elapsed "$elapsed")"
+  else
+    active="no"
+    printf 'day_active: %s\n' "$active"
+    printf 'start_time: <none>\n'
+    printf 'elapsed: 00h 00m 00s\n'
+  fi
+
+  status_line_pid "prompt_pid" "${prompt_pid:-}" "__prompt-loop"
+  status_line_pid "eod_pid" "${eod_pid:-}" "__eod-wait"
+
+  printf 'last_task_text: %s\n' "${last_task_text:-<none>}"
+  if [[ -n "${last_prompt_ts:-}" ]]; then
+    printf 'last_prompt_at: %s\n' "$(date -r "$last_prompt_ts" +"%Y-%m-%d %H:%M:%S")"
+  else
+    printf 'last_prompt_at: <none>\n'
+  fi
+
+  if [[ -n "${meditation_url:-}" ]]; then
+    printf 'meditation_url_set: yes\n'
+    printf 'meditation_url: %s\n' "$meditation_url"
+  else
+    printf 'meditation_url_set: no\n'
+  fi
+  printf 'state_file: %s\n' "$STATE_FILE"
+  printf 'log_file: %s\n' "$LOG_FILE"
+}
+
+run_meditation_timer() {
+  local seconds="${1:-360}"
+  sleep "$seconds"
+  notify_message "Meditation complete." "Work Chill"
+  printf '%s meditation_complete seconds=%s\n' "$(iso_ts)" "$seconds" >> "$BG_LOG_FILE" 2>/dev/null || true
+}
+
+start_meditation_best_effort() {
+  load_state
+  local seconds
+  seconds="$(meditation_timer_sec)"
+  if [[ -n "${meditation_url:-}" ]]; then
+    open "$meditation_url" >/dev/null 2>&1 || true
+    nohup "$SCRIPT_PATH" __meditation-timer "$seconds" >> "$BG_LOG_FILE" 2>&1 &
+    disown "$!" 2>/dev/null || true
+  fi
+}
+
+shutdown_flow() {
+  local action="${1:-manual}"
+  load_state
+
+  local tomorrow_first_step=""
+  local open_items=""
+
+  tomorrow_first_step="$(get_text_input "Tomorrow first step:" "Shutdown")"
+  open_items="$(get_text_input "Known open items intentionally parked:" "Shutdown")"
+  confirm_ok "Work is parked." "Shutdown"
+
+  log_event "SHUTDOWN" "$action" "${last_task_text:-}" "$tomorrow_first_step" "$open_items"
+
+  cancel_jobs_only
+  reset_active_day_state
+  save_state
+
+  start_meditation_best_effort
+}
+
+run_shutdown() {
+  shutdown_flow "manual"
+  printf 'Shutdown complete.\n'
+}
+
+run_cancel() {
+  load_state
+  cancel_jobs_only
+  reset_active_day_state
+  save_state
+  log_event "CANCEL" "cancel" "" "" ""
+  printf 'Cancelled active jobs and cleared active day state.\n'
+}
+
+run_debug_prompt() {
+  run_task_pulse
+  printf 'Debug prompt executed.\n'
+}
+
+run_set_meditation_url() {
+  local url="${1:-}"
+  if [[ -z "$url" ]]; then
+    printf 'Usage: work_chill set-meditation-url "<url>"\n' >&2
+    exit 1
+  fi
+  load_state
+  meditation_url="$url"
+  save_state
+  printf 'Meditation URL set.\n'
+}
+
+run_clear_meditation_url() {
+  load_state
+  meditation_url=""
+  save_state
+  printf 'Meditation URL cleared.\n'
+}
+
+run_tail() {
+  ensure_data_dir
+  tail -n 50 -f "$LOG_FILE"
+}
+
+run_doctor() {
+  local failures=0
+
+  printf 'work_chill doctor\n'
+
+  if command -v osascript >/dev/null 2>&1; then
+    printf '[ok] osascript available: %s\n' "$(command -v osascript)"
+  else
+    printf '[fail] osascript not found\n'
+    failures=$((failures + 1))
+  fi
+
+  if command -v open >/dev/null 2>&1; then
+    printf '[ok] open available: %s\n' "$(command -v open)"
+  else
+    printf '[fail] open command not found\n'
+    failures=$((failures + 1))
+  fi
+
+  if command -v work_chill >/dev/null 2>&1; then
+    printf '[ok] work_chill on PATH: %s\n' "$(command -v work_chill)"
+  else
+    printf '[fail] work_chill not found on PATH\n'
+    failures=$((failures + 1))
+  fi
+
+  case ":$PATH:" in
+    *":$HOME/bin:"*) printf '[ok] ~/bin present in PATH\n' ;;
+    *)
+      printf '[fail] ~/bin missing from PATH\n'
+      failures=$((failures + 1))
+      ;;
+  esac
+
+  if mkdir -p "$DATA_DIR" 2>/dev/null; then
+    printf '[ok] data dir ready: %s\n' "$DATA_DIR"
+  else
+    printf '[fail] cannot create/access data dir: %s\n' "$DATA_DIR"
+    failures=$((failures + 1))
+  fi
+
+  if [[ -f "$STATE_FILE" ]] || touch "$STATE_FILE" 2>/dev/null; then
+    if [[ -w "$STATE_FILE" ]]; then
+      printf '[ok] state file writable: %s\n' "$STATE_FILE"
+    else
+      printf '[fail] state file not writable: %s\n' "$STATE_FILE"
+      failures=$((failures + 1))
+    fi
+  else
+    printf '[fail] cannot create state file: %s\n' "$STATE_FILE"
+    failures=$((failures + 1))
+  fi
+
+  if [[ -f "$LOG_FILE" ]] || touch "$LOG_FILE" 2>/dev/null; then
+    if [[ -w "$LOG_FILE" ]]; then
+      printf '[ok] log file writable: %s\n' "$LOG_FILE"
+    else
+      printf '[fail] log file not writable: %s\n' "$LOG_FILE"
+      failures=$((failures + 1))
+    fi
+  else
+    printf '[fail] cannot create log file: %s\n' "$LOG_FILE"
+    failures=$((failures + 1))
+  fi
+
+  if [[ -r "$STATE_FILE" ]]; then
+    if bash -n "$STATE_FILE" >/dev/null 2>&1; then
+      printf '[ok] state file syntax parseable\n'
+    else
+      printf '[fail] state file syntax invalid: %s\n' "$STATE_FILE"
+      failures=$((failures + 1))
+    fi
+  fi
+
+  if [[ "$failures" -eq 0 ]]; then
+    printf 'doctor_result: healthy\n'
+    return 0
+  fi
+
+  printf 'doctor_result: issues_found (%s)\n' "$failures"
+  return 1
+}
+
+run_help() {
+  cat <<'EOF'
+work_chill - personal work pacing helper
+
+Commands:
+  work_chill start [--end-at HH:MM]
+  work_chill status
+  work_chill shutdown
+  work_chill cancel
+  work_chill debug-prompt
+  work_chill set-meditation-url "<url>"
+  work_chill clear-meditation-url
+  work_chill tail
+  work_chill doctor
+  work_chill help
+
+State + logs:
+  ~/.work_chill/state.sh
+  ~/.work_chill/log.jsonl
+  ~/.work_chill/bg.log
+
+Testing mode:
+  WORK_CHILL_TEST=1
+  - prompt interval: 10 seconds
+  - day length: 2 minutes (unless --end-at is provided)
+  - meditation timer: 15 seconds
+EOF
+}
+
+run_prompt_loop() {
+  local start_ts="${1:-}"
+  local interval
+  interval="$(prompt_interval_sec)"
+
+  while true; do
+    sleep "$interval"
+    load_state
+    if [[ -z "${day_start_ts:-}" || "${day_start_ts:-}" != "$start_ts" ]]; then
+      exit 0
+    fi
+    run_task_pulse
+  done
+}
+
+run_eod_wait() {
+  local start_ts="${1:-}"
+  local length="${2:-}"
+  if [[ -z "$length" ]]; then
+    length="$(day_length_sec)"
+  fi
+  sleep "$length"
+  load_state
+  if [[ -n "${day_start_ts:-}" && "${day_start_ts:-}" == "$start_ts" ]]; then
+    "$SCRIPT_PATH" __shutdown "auto" >/dev/null 2>&1 || true
+  fi
+}
+
+internal_shutdown() {
+  local mode="${1:-auto}"
+  shutdown_flow "$mode"
+}
+
+main() {
+  SCRIPT_PATH="$(resolve_script_path)"
+  ensure_data_dir
+  local cmd="${1:-help}"
+  shift || true
+
+  case "$cmd" in
+    start) run_start "$@" ;;
+    status) run_status ;;
+    shutdown) run_shutdown ;;
+    cancel) run_cancel ;;
+    debug-prompt) run_debug_prompt ;;
+    set-meditation-url) run_set_meditation_url "${1:-}" ;;
+    clear-meditation-url) run_clear_meditation_url ;;
+    tail) run_tail ;;
+    doctor) run_doctor ;;
+    help|-h|--help) run_help ;;
+    __prompt-loop) run_prompt_loop "${1:-}" ;;
+    __eod-wait) run_eod_wait "${1:-}" "${2:-}" ;;
+    __shutdown) internal_shutdown "${1:-auto}" ;;
+    __meditation-timer) run_meditation_timer "${1:-360}" ;;
+    *)
+      printf 'Unknown command: %s\n\n' "$cmd" >&2
+      run_help
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

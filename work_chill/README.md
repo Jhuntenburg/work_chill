@@ -18,6 +18,7 @@ Personal macOS work pacing helper script.
 ## Install
 
 ```bash
+cd /Users/joseph/hss_docker/work_chill
 install -m 755 ./work_chill "$HOME/bin/work_chill"
 ```
 

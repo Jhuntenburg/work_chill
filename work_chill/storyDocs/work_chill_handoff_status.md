@@ -19,11 +19,11 @@ Implemented a low-friction macOS terminal workflow named `work_chill` with:
 
 ## Files Added / Updated
 
-- Script source in repo: `/Users/joseph/hss_docker/work_chill`
+- Script source in repo: `/Users/joseph/hss_docker/work_chill/work_chill`
 - Installed executable: `/Users/joseph/bin/work_chill`
 - Markdown viewer script: `/Users/joseph/bin/chill_render_markdown`
 - Usage guide: `/Users/joseph/work_chill_usage.md`
-- This handoff file: `/Users/joseph/hss_docker/storyDocs/work_chill_handoff_status.md`
+- This handoff file: `/Users/joseph/hss_docker/work_chill/storyDocs/work_chill_handoff_status.md`
 
 ## Shell Setup (`~/.zshrc`)
 
@@ -194,7 +194,7 @@ Observed:
 
 ```bash
 export PATH="$HOME/bin:$PATH"
-bash -n /Users/joseph/hss_docker/work_chill
+bash -n /Users/joseph/hss_docker/work_chill/work_chill
 work_chill doctor
 work_chill status
 tail -n 20 /Users/joseph/.work_chill/log.jsonl
@@ -205,4 +205,4 @@ tail -n 20 /Users/joseph/.work_chill/bg.log
 
 Use this to resume quickly:
 
-“Use `/Users/joseph/hss_docker/storyDocs/work_chill_handoff_status.md` as the source of truth. Improve `work_chill` without breaking existing behavior. Keep install idempotent, preserve logs/state format, and re-run doctor/status validation after changes.”
+“Use `/Users/joseph/hss_docker/work_chill/storyDocs/work_chill_handoff_status.md` as the source of truth. Improve `work_chill` without breaking existing behavior. Keep install idempotent, preserve logs/state format, and re-run doctor/status validation after changes.”

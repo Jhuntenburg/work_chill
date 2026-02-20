@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SRC="${1:-$SCRIPT_DIR/work_chill_usage.md}"
+OUT="/tmp/work_chill_usage_rendered.html"
+
+python3 - "$SRC" "$OUT" <<'PY'
+import html
+import pathlib
+import re
+import sys
+
+src = pathlib.Path(sys.argv[1])
+out = pathlib.Path(sys.argv[2])
+text = src.read_text(encoding="utf-8")
+lines = text.splitlines()
+
+parts = []
+in_code = False
+in_ul = False
+in_ol = False
+
+
+def close_lists():
+    global in_ul, in_ol
+    if in_ul:
+        parts.append("</ul>")
+        in_ul = False
+    if in_ol:
+        parts.append("</ol>")
+        in_ol = False
+
+
+def inline(s: str) -> str:
+    s = html.escape(s)
+    s = re.sub(r"`([^`]+)`", r"<code>\1</code>", s)
+    s = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", s)
+    return s
+
+for raw in lines:
+    line = raw.rstrip("\n")
+    stripped = line.strip()
+
+    if stripped.startswith("```"):
+        close_lists()
+        if not in_code:
+            parts.append("<pre><code>")
+            in_code = True
+        else:
+            parts.append("</code></pre>")
+            in_code = False
+        continue
+
+    if in_code:
+        parts.append(html.escape(line))
+        continue
+
+    if stripped == "":
+        close_lists()
+        continue
+
+    m = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+    if m:
+        close_lists()
+        lvl = len(m.group(1))
+        parts.append(f"<h{lvl}>{inline(m.group(2))}</h{lvl}>")
+        continue
+
+    m = re.match(r"^[-*]\s+(.*)$", stripped)
+    if m:
+        if in_ol:
+            parts.append("</ol>")
+            in_ol = False
+        if not in_ul:
+            parts.append("<ul>")
+            in_ul = True
+        parts.append(f"<li>{inline(m.group(1))}</li>")
+        continue
+
+    m = re.match(r"^\d+\.\s+(.*)$", stripped)
+    if m:
+        if in_ul:
+            parts.append("</ul>")
+            in_ul = False
+        if not in_ol:
+            parts.append("<ol>")
+            in_ol = True
+        parts.append(f"<li>{inline(m.group(1))}</li>")
+        continue
+
+    close_lists()
+    parts.append(f"<p>{inline(stripped)}</p>")
+
+if in_code:
+    parts.append("</code></pre>")
+close_lists()
+
+body_html = "\n".join(parts)
+
+html_doc = f"""<!doctype html>
+<html lang=\"en\">
+<head>
+  <meta charset=\"utf-8\">
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+  <title>{html.escape(src.name)}</title>
+  <style>
+    body {{
+      margin: 32px auto;
+      max-width: 900px;
+      padding: 0 20px;
+      font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: #111;
+      background: #f8fafc;
+    }}
+    h1,h2,h3,h4,h5,h6 {{ line-height: 1.25; margin-top: 1.4em; }}
+    p, ul, ol, pre {{ margin: 0.8em 0; }}
+    code {{
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      background: #eef2ff;
+      padding: 0.1em 0.35em;
+      border-radius: 6px;
+    }}
+    pre {{
+      background: #0b1020;
+      color: #e5e7eb;
+      padding: 14px;
+      border-radius: 10px;
+      overflow-x: auto;
+      white-space: pre-wrap;
+    }}
+    pre code {{ background: transparent; padding: 0; color: inherit; }}
+  </style>
+</head>
+<body>
+{body_html}
+</body>
+</html>
+"""
+
+out.write_text(html_doc, encoding="utf-8")
+PY
+
+open -a "Google Chrome" "$OUT" >/dev/null 2>&1 || open "$OUT"

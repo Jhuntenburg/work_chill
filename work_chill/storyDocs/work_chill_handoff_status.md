@@ -1,6 +1,6 @@
 # Work Chill Handoff and Status
 
-Last updated: 2026-02-19 (America/New_York)
+Last updated: 2026-02-20 (America/New_York)
 
 ## Scope Completed
 
@@ -11,6 +11,8 @@ Implemented a low-friction macOS terminal workflow named `work_chill` with:
 - Event logging now writes event-specific JSON keys (reduced log noise on non-shutdown events).
 - Auto end-of-day trigger after 8 hours (or 2 minutes in test mode), with optional clock-time scheduling via `--end-at HH:MM`.
 - Friction-check prompt loop every 55 minutes with AppleScript button UI (or terminal fallback).
+- Pause/resume controls (`pause`, `resume`) so 8-hour shutdown is based on active work time (excluding paused breaks).
+- Escalation flow after 3 consecutive `same_as_last` responses and on `stuck`.
 - Guided shutdown ritual and meditation follow-up.
 - Local state/log persistence under `~/.work_chill`.
 - Idempotent shell setup in `~/.zshrc` with aliases.
@@ -21,8 +23,9 @@ Implemented a low-friction macOS terminal workflow named `work_chill` with:
 
 - Script source in repo: `/Users/joseph/hss_docker/work_chill/work_chill`
 - Installed executable: `/Users/joseph/bin/work_chill`
-- Markdown viewer script: `/Users/joseph/bin/chill_render_markdown`
-- Usage guide: `/Users/joseph/work_chill_usage.md`
+- Markdown viewer script (repo): `/Users/joseph/hss_docker/work_chill/chill_render_markdown`
+- Markdown viewer script (legacy install): `/Users/joseph/bin/chill_render_markdown`
+- Usage guide: `/Users/joseph/hss_docker/work_chill/work_chill_usage.md`
 - This handoff file: `/Users/joseph/hss_docker/work_chill/storyDocs/work_chill_handoff_status.md`
 
 ## Shell Setup (`~/.zshrc`)
@@ -35,11 +38,13 @@ Confirmed lines:
 - `alias wdstop='work_chill cancel'`
 - `alias wdshutdown='work_chill shutdown'`
 - `alias wdtail='work_chill tail'`
-- `alias chill='chill_render_markdown /Users/joseph/work_chill_usage.md'`
+- `alias chill='/Users/joseph/hss_docker/work_chill/chill_render_markdown'`
 
 ## Commands Implemented
 
 - `work_chill start [--end-at HH:MM]`
+- `work_chill pause`
+- `work_chill resume`
 - `work_chill status`
 - `work_chill shutdown`
 - `work_chill cancel`
@@ -60,6 +65,13 @@ Confirmed lines:
   - `meditation_url`
   - `last_task_text`
   - `last_prompt_ts`
+  - `paused` (`yes`/`no`)
+  - `pause_started_ts`
+  - `paused_total_secs`
+  - `day_length_secs`
+  - `prompt_interval_secs`
+  - `consecutive_same_count`
+  - `last_action`
 - Event log: `/Users/joseph/.work_chill/log.jsonl`
 - Background log: `/Users/joseph/.work_chill/bg.log`
 
@@ -74,7 +86,7 @@ Confirmed lines:
 Installed binaries present and executable:
 
 - `/Users/joseph/bin/work_chill`
-- `/Users/joseph/bin/chill_render_markdown`
+- `/Users/joseph/hss_docker/work_chill/chill_render_markdown`
 
 ## Test Evidence Completed
 
@@ -144,6 +156,9 @@ Verified end-of-day clock-time scheduling:
   - `DAY_START`: `ts`, `event`, `action`, `day_start_ts`
   - `TASK_PULSE`: `ts`, `event`, `action`, `task_text`, `day_start_ts`
   - `TASK_PULSE_SKIPPED`: `ts`, `event`, `action`, `day_start_ts`
+  - `PAUSE`: `ts`, `event`, `action`, `day_start_ts`, `active_elapsed_secs`
+  - `RESUME`: `ts`, `event`, `action`, `day_start_ts`, `paused_delta_secs`
+  - `ESCALATION`: `ts`, `event`, `action`, `day_start_ts`, `choice`, plus optional `blocker_text`/`next_step_text`
   - `SHUTDOWN`: `ts`, `event`, `action`, `task_text`, `day_start_ts`, `tomorrow_first_step`, `open_items`
   - `CANCEL`: `ts`, `event`, `action`
 - Backward compatibility retained:
@@ -180,6 +195,87 @@ Observed:
 - New `TASK_PULSE_SKIPPED` line contains only `ts`, `event`, `action`, `day_start_ts`.
 - New `CANCEL` lines contain only `ts`, `event`, `action`.
 - New `SHUTDOWN` line still contains `tomorrow_first_step` and `open_items`.
+
+## 2026-02-20 Feature Upgrade Validation
+
+Implemented requested upgrades in `/Users/joseph/hss_docker/work_chill/work_chill` and installed to `/Users/joseph/bin/work_chill`.
+
+### Pause/Resume
+
+- Added commands:
+  - `work_chill pause`
+  - `work_chill resume`
+- `pause` behavior:
+  - no active day -> informational exit
+  - already paused -> informational exit
+  - sets `paused=yes`, `pause_started_ts=now`
+  - kills prompt + EOD workers safely
+  - logs `PAUSE` with `active_elapsed_secs`
+- `resume` behavior:
+  - no active day / not paused -> informational exit
+  - computes pause delta and increments `paused_total_secs`
+  - clears pause state
+  - reschedules prompt loop and EOD wait from remaining active seconds
+  - logs `RESUME` with `paused_delta_secs`
+- `status` now shows:
+  - `paused`, `paused_total_secs`, `active_elapsed_secs`, `remaining_secs`
+  - `day_length_secs`, `prompt_interval_secs`
+  - paused marker (`timers: paused`) and no-live-pids state is expected while paused
+
+### Escalation
+
+- Added state tracking:
+  - `consecutive_same_count`
+  - `last_action`
+- Triggering:
+  - `same_as_last` increments count
+  - non-`same_as_last` resets count
+  - `stuck` triggers escalation immediately
+  - `consecutive_same_count >= 3` triggers escalation
+- Escalation UI:
+  - title: `Quick reset`
+  - buttons: `2-min break`, `Name blocker`, `Next micro-step`
+  - timeout/cancel maps to ignore behavior
+- Escalation actions:
+  - break: opens `https://www.youtube.com/watch?v=Ih-rtou1PTc`, sends notifications, logs `ESCALATION` choice `break`
+  - blocker: prompts one-sentence blocker, logs `ESCALATION` with `blocker_text`
+  - next step: prompts smallest next step, logs `ESCALATION` with `next_step_text`
+  - ignore: logs `ESCALATION` choice `ignore`
+- Test-mode break timer:
+  - `WORK_CHILL_TEST=1` -> break timer is 10 seconds
+
+### Validation Run (2026-02-20)
+
+Executed sequence:
+
+1. `work_chill cancel`
+2. `WORK_CHILL_TEST=1 work_chill start`
+3. Simulated three same responses with:
+   - `WORK_CHILL_TEST=1 WORK_CHILL_FORCE_ACTION=same_as_last work_chill debug-prompt` (x3)
+4. Simulated stuck with:
+   - `WORK_CHILL_TEST=1 WORK_CHILL_FORCE_ACTION=stuck work_chill debug-prompt`
+5. `work_chill pause`
+6. wait ~10s
+7. `work_chill resume`
+8. `work_chill status`
+9. `tail -n 30 ~/.work_chill/log.jsonl`
+10. `tail -n 40 ~/.work_chill/bg.log`
+
+Observed:
+
+- Escalation triggered after third same and on stuck:
+  - bg log entries:
+    - `escalation_trigger reason="same_as_last_3"`
+    - `escalation_trigger reason="stuck"`
+    - `escalation_dialog rc=0 output="Ignore" stderr=""` (dialog path executed)
+- Pause/resume active-time accounting works:
+  - `PAUSE` logged with `active_elapsed_secs:"15"`
+  - `RESUME` logged with `paused_delta_secs:"10"`
+  - status after resume showed:
+    - `paused_total_secs: 10`
+    - `active_elapsed_secs: 27`
+    - `remaining_secs: 93`
+    - live `prompt_pid` and `eod_pid`
 
 ## Usage Quickstart
 

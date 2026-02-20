@@ -9,6 +9,7 @@ BG_LOG_FILE="${DATA_DIR}/bg.log"
 SCRIPT_PATH=""
 
 DEFAULT_MEDITATION_URL="https://youtu.be/7CaaHXjoRhA?si=LMDnR8tb5zmGMRV-"
+ESCALATION_BREAK_URL="https://www.youtube.com/watch?v=Ih-rtou1PTc"
 
 day_start_ts=""
 prompt_pid=""
@@ -16,6 +17,13 @@ eod_pid=""
 meditation_url="$DEFAULT_MEDITATION_URL"
 last_task_text=""
 last_prompt_ts=""
+paused="no"
+pause_started_ts=""
+paused_total_secs="0"
+day_length_secs=""
+prompt_interval_secs=""
+consecutive_same_count="0"
+last_action=""
 
 is_test_mode() {
   [[ "${WORK_CHILL_TEST:-0}" == "1" ]]
@@ -35,6 +43,92 @@ day_length_sec() {
   else
     printf '28800'
   fi
+}
+
+escalation_break_timer_sec() {
+  if is_test_mode; then
+    printf '10'
+  else
+    printf '150'
+  fi
+}
+
+int_or_default() {
+  local value="${1:-}"
+  local fallback="${2:-0}"
+  if [[ "$value" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$value"
+  else
+    printf '%s' "$fallback"
+  fi
+}
+
+state_prompt_interval_secs() {
+  local interval
+  interval="$(int_or_default "${prompt_interval_secs:-}" "0")"
+  if [[ "$interval" -le 0 ]]; then
+    interval="$(prompt_interval_sec)"
+  fi
+  printf '%s' "$interval"
+}
+
+state_day_length_secs() {
+  local length
+  length="$(int_or_default "${day_length_secs:-}" "0")"
+  if [[ "$length" -le 0 ]]; then
+    length="$(day_length_sec)"
+  fi
+  printf '%s' "$length"
+}
+
+effective_paused_total_secs() {
+  local now="${1:-}"
+  local total
+  local delta=0
+  total="$(int_or_default "${paused_total_secs:-}" "0")"
+
+  if [[ "${paused:-no}" == "yes" && "${pause_started_ts:-}" =~ ^[0-9]+$ && "$now" =~ ^[0-9]+$ ]]; then
+    if (( now > pause_started_ts )); then
+      delta=$((now - pause_started_ts))
+      total=$((total + delta))
+    fi
+  fi
+
+  printf '%s' "$total"
+}
+
+compute_active_elapsed_secs() {
+  local now="${1:-}"
+  local elapsed=0
+  local paused_secs=0
+  local active=0
+
+  if [[ -z "${day_start_ts:-}" || ! "${day_start_ts:-}" =~ ^[0-9]+$ || ! "$now" =~ ^[0-9]+$ ]]; then
+    printf '0'
+    return 0
+  fi
+
+  if (( now > day_start_ts )); then
+    elapsed=$((now - day_start_ts))
+  fi
+  paused_secs="$(effective_paused_total_secs "$now")"
+  active=$((elapsed - paused_secs))
+  if (( active < 0 )); then
+    active=0
+  fi
+  printf '%s' "$active"
+}
+
+compute_remaining_secs() {
+  local now="${1:-}"
+  local length active remaining
+  length="$(state_day_length_secs)"
+  active="$(compute_active_elapsed_secs "$now")"
+  remaining=$((length - active))
+  if (( remaining < 0 )); then
+    remaining=0
+  fi
+  printf '%s' "$remaining"
 }
 
 is_valid_hhmm() {
@@ -138,6 +232,13 @@ save_state() {
     printf 'export meditation_url=%q\n' "${meditation_url:-}"
     printf 'export last_task_text=%q\n' "${last_task_text:-}"
     printf 'export last_prompt_ts=%q\n' "${last_prompt_ts:-}"
+    printf 'export paused=%q\n' "${paused:-no}"
+    printf 'export pause_started_ts=%q\n' "${pause_started_ts:-}"
+    printf 'export paused_total_secs=%q\n' "${paused_total_secs:-0}"
+    printf 'export day_length_secs=%q\n' "${day_length_secs:-}"
+    printf 'export prompt_interval_secs=%q\n' "${prompt_interval_secs:-}"
+    printf 'export consecutive_same_count=%q\n' "${consecutive_same_count:-0}"
+    printf 'export last_action=%q\n' "${last_action:-}"
   } > "$STATE_FILE"
 }
 
@@ -148,11 +249,38 @@ load_state() {
   meditation_url="$DEFAULT_MEDITATION_URL"
   last_task_text=""
   last_prompt_ts=""
+  paused="no"
+  pause_started_ts=""
+  paused_total_secs="0"
+  day_length_secs=""
+  prompt_interval_secs=""
+  consecutive_same_count="0"
+  last_action=""
 
   if [[ -f "$STATE_FILE" ]]; then
     # shellcheck disable=SC1090
     source "$STATE_FILE"
   fi
+
+  paused="${paused:-no}"
+  if [[ "$paused" != "yes" ]]; then
+    paused="no"
+  fi
+  pause_started_ts="$(int_or_default "${pause_started_ts:-}" "0")"
+  if [[ "$pause_started_ts" -eq 0 ]]; then
+    pause_started_ts=""
+  fi
+  paused_total_secs="$(int_or_default "${paused_total_secs:-}" "0")"
+  day_length_secs="$(int_or_default "${day_length_secs:-}" "0")"
+  if [[ "$day_length_secs" -eq 0 ]]; then
+    day_length_secs="$(day_length_sec)"
+  fi
+  prompt_interval_secs="$(int_or_default "${prompt_interval_secs:-}" "0")"
+  if [[ "$prompt_interval_secs" -eq 0 ]]; then
+    prompt_interval_secs="$(prompt_interval_sec)"
+  fi
+  consecutive_same_count="$(int_or_default "${consecutive_same_count:-}" "0")"
+  last_action="${last_action:-}"
 }
 
 log_event() {
@@ -179,6 +307,26 @@ log_event() {
       ;;
     "TASK_PULSE_SKIPPED")
       json+=",$(log_json_kv "day_start_ts" "${day_start_ts:-}")"
+      ;;
+    "PAUSE")
+      json+=",$(log_json_kv "day_start_ts" "${day_start_ts:-}")"
+      json+=",$(log_json_kv "active_elapsed_secs" "$task_text")"
+      ;;
+    "RESUME")
+      json+=",$(log_json_kv "day_start_ts" "${day_start_ts:-}")"
+      json+=",$(log_json_kv "paused_delta_secs" "$task_text")"
+      ;;
+    "ESCALATION")
+      json+=",$(log_json_kv "day_start_ts" "${day_start_ts:-}")"
+      json+=",$(log_json_kv "choice" "$action")"
+      case "$action" in
+        "blocker")
+          json+=",$(log_json_kv "blocker_text" "$task_text")"
+          ;;
+        "next_step")
+          json+=",$(log_json_kv "next_step_text" "$task_text")"
+          ;;
+      esac
       ;;
     "SHUTDOWN")
       json+=",$(log_json_kv "task_text" "$task_text")"
@@ -245,12 +393,16 @@ kill_pid_if_ours() {
   fi
 }
 
-cancel_jobs_only() {
-  load_state
+cancel_jobs_in_memory() {
   kill_pid_if_ours "${prompt_pid:-}" "__prompt-loop"
   kill_pid_if_ours "${eod_pid:-}" "__eod-wait"
   prompt_pid=""
   eod_pid=""
+}
+
+cancel_jobs_only() {
+  load_state
+  cancel_jobs_in_memory
 }
 
 reset_active_day_state() {
@@ -258,6 +410,13 @@ reset_active_day_state() {
   prompt_pid=""
   eod_pid=""
   last_prompt_ts=""
+  paused="no"
+  pause_started_ts=""
+  paused_total_secs="0"
+  day_length_secs="$(day_length_sec)"
+  prompt_interval_secs="$(prompt_interval_sec)"
+  consecutive_same_count="0"
+  last_action=""
 }
 
 resolve_button_from_osascript_output() {
@@ -333,6 +492,13 @@ prompt_action_terminal() {
 
 get_action_choice() {
   local action=""
+  case "${WORK_CHILL_FORCE_ACTION:-}" in
+    "same_as_last") printf 'Same as last'; return 0 ;;
+    "new_task") printf 'New task'; return 0 ;;
+    "stuck") printf 'Stuck'; return 0 ;;
+    "skip") printf 'Skip'; return 0 ;;
+  esac
+
   action="$(prompt_action_osascript || true)"
   if [[ -n "$action" ]]; then
     printf '%s' "$action"
@@ -346,6 +512,89 @@ get_action_choice() {
     bg_log "prompt_dialog_fallback mode=\"skip_no_tty\""
     printf 'Skip'
   fi
+}
+
+escalation_choice_osascript() {
+  local out=""
+  local rc=0
+  local timeout
+  local tmp_err=""
+  local stderr_text=""
+  timeout="$(pulse_dialog_timeout_sec)"
+  tmp_err="$(mktemp "${TMPDIR:-/tmp}/work_chill_escalation.XXXXXX")"
+  out="$(osascript <<APPLESCRIPT 2>"$tmp_err"
+activate
+set d to display dialog "You've been on the same thing for a while (or marked stuck).
+Take 10 seconds to reset." with title "Quick reset" buttons {"2-min break", "Name blocker", "Next micro-step"} default button "Next micro-step" giving up after $timeout
+if gave up of d then return "Ignore"
+return button returned of d
+APPLESCRIPT
+)"
+  rc=$?
+  stderr_text="$(single_line "$(cat "$tmp_err" 2>/dev/null || true)")"
+  rm -f "$tmp_err"
+
+  bg_log "escalation_dialog rc=$rc output=\"$(single_line "$out")\" stderr=\"$stderr_text\""
+
+  if [[ "$rc" -ne 0 ]]; then
+    if [[ "$stderr_text" == *"(-128)"* ]]; then
+      printf 'Ignore'
+      return 0
+    fi
+    return 1
+  fi
+
+  if [[ "$out" == "2-min break" || "$out" == "Name blocker" || "$out" == "Next micro-step" || "$out" == "Ignore" ]]; then
+    printf '%s' "$out"
+    return 0
+  fi
+
+  out="$(resolve_button_from_osascript_output "$out")"
+  if [[ "$out" == "2-min break" || "$out" == "Name blocker" || "$out" == "Next micro-step" ]]; then
+    printf '%s' "$out"
+    return 0
+  fi
+  printf 'Ignore'
+}
+
+escalation_choice_terminal() {
+  local choice=""
+  printf '\nQuick reset\n'
+  printf '1) 2-min break\n'
+  printf '2) Name blocker\n'
+  printf '3) Next micro-step\n'
+  printf '4) Ignore\n'
+  printf 'Choose [1-4]: '
+  IFS= read -r choice
+  case "$choice" in
+    1) printf '2-min break' ;;
+    2) printf 'Name blocker' ;;
+    3) printf 'Next micro-step' ;;
+    *) printf 'Ignore' ;;
+  esac
+}
+
+get_escalation_choice() {
+  local choice=""
+  case "${WORK_CHILL_FORCE_ESCALATION_CHOICE:-}" in
+    "break") printf '2-min break'; return 0 ;;
+    "blocker") printf 'Name blocker'; return 0 ;;
+    "next_step") printf 'Next micro-step'; return 0 ;;
+    "ignore") printf 'Ignore'; return 0 ;;
+  esac
+
+  choice="$(escalation_choice_osascript || true)"
+  if [[ -n "$choice" ]]; then
+    printf '%s' "$choice"
+    return 0
+  fi
+
+  if [[ -t 0 ]]; then
+    escalation_choice_terminal
+    return 0
+  fi
+
+  printf 'Ignore'
 }
 
 text_input_osascript() {
@@ -539,27 +788,79 @@ APPLESCRIPT
   return 1
 }
 
+run_escalation_break_timer() {
+  local seconds="${1:-150}"
+  sleep "$seconds"
+  notify_message "Back to it-what's next?" "Work Chill"
+  printf '%s escalation_break_complete seconds=%s\n' "$(iso_ts)" "$seconds" >> "$BG_LOG_FILE" 2>/dev/null || true
+}
+
+trigger_escalation() {
+  local reason="${1:-}"
+  local choice=""
+  local input_text=""
+  local break_secs=0
+
+  bg_log "escalation_trigger reason=\"$reason\""
+  choice="$(get_escalation_choice)"
+
+  case "$choice" in
+    "2-min break")
+      notify_message "2 minutes-breathe." "Work Chill"
+      open "$ESCALATION_BREAK_URL" >/dev/null 2>&1 || true
+      break_secs="$(escalation_break_timer_sec)"
+      nohup "$SCRIPT_PATH" __escalation-break-timer "$break_secs" >> "$BG_LOG_FILE" 2>&1 &
+      disown "$!" 2>/dev/null || true
+      log_event "ESCALATION" "break" "" "" ""
+      ;;
+    "Name blocker")
+      input_text="$(get_text_input "What's the blocker in 1 sentence?" "Quick reset")"
+      log_event "ESCALATION" "blocker" "$input_text" "" ""
+      ;;
+    "Next micro-step")
+      input_text="$(get_text_input "What's the next smallest step?" "Quick reset")"
+      log_event "ESCALATION" "next_step" "$input_text" "" ""
+      ;;
+    *)
+      log_event "ESCALATION" "ignore" "" "" ""
+      ;;
+  esac
+}
+
 run_task_pulse() {
   load_state
   local action=""
   local task_text=""
+  local now=""
+  local should_escalate="no"
+  local escalation_reason=""
 
   action="$(get_action_choice)"
+  now="$(date +%s)"
   case "$action" in
     "Same as last")
       task_text="${last_task_text:-}"
       if [[ -z "$task_text" ]]; then
         task_text="$(get_text_input "Enter current task:" "Friction Check")"
       fi
+      consecutive_same_count="$(int_or_default "${consecutive_same_count:-}" "0")"
+      consecutive_same_count=$((consecutive_same_count + 1))
+      last_action="same_as_last"
+      if [[ "$consecutive_same_count" -ge 3 ]]; then
+        should_escalate="yes"
+        escalation_reason="same_as_last_${consecutive_same_count}"
+      fi
       last_task_text="$task_text"
-      last_prompt_ts="$(date +%s)"
+      last_prompt_ts="$now"
       save_state
       log_event "TASK_PULSE" "same_as_last" "$task_text" "" ""
       ;;
     "New task")
       task_text="$(get_text_input "Enter current task:" "Friction Check")"
+      consecutive_same_count="0"
+      last_action="new_task"
       last_task_text="$task_text"
-      last_prompt_ts="$(date +%s)"
+      last_prompt_ts="$now"
       save_state
       log_event "TASK_PULSE" "new_task" "$task_text" "" ""
       ;;
@@ -568,22 +869,36 @@ run_task_pulse() {
       if [[ -z "$task_text" ]]; then
         task_text="$(get_text_input "Enter current task:" "Friction Check")"
       fi
+      consecutive_same_count="0"
+      last_action="stuck"
+      should_escalate="yes"
+      escalation_reason="stuck"
       last_task_text="$task_text"
-      last_prompt_ts="$(date +%s)"
+      last_prompt_ts="$now"
       save_state
       log_event "TASK_PULSE" "stuck" "$task_text" "" ""
       ;;
     *)
-      last_prompt_ts="$(date +%s)"
+      consecutive_same_count="0"
+      last_action="skip"
+      last_prompt_ts="$now"
       save_state
       log_event "TASK_PULSE_SKIPPED" "skip" "" "" ""
       ;;
   esac
+
+  if [[ "$should_escalate" == "yes" ]]; then
+    trigger_escalation "$escalation_reason"
+  fi
 }
 
 start_prompt_loop_bg() {
   local start_ts="${1:-}"
-  nohup "$SCRIPT_PATH" __prompt-loop "$start_ts" >> "$BG_LOG_FILE" 2>&1 &
+  local interval="${2:-}"
+  if [[ -z "$interval" ]]; then
+    interval="$(state_prompt_interval_secs)"
+  fi
+  nohup "$SCRIPT_PATH" __prompt-loop "$start_ts" "$interval" >> "$BG_LOG_FILE" 2>&1 &
   prompt_pid="$!"
   disown "$prompt_pid" 2>/dev/null || true
 }
@@ -602,6 +917,7 @@ start_eod_bg() {
 run_start() {
   local end_at=""
   local eod_wait=""
+  local interval=""
 
   while [[ "$#" -gt 0 ]]; do
     case "${1:-}" in
@@ -648,10 +964,18 @@ run_start() {
   show_welcome_back_summary || true
 
   day_start_ts="$(date +%s)"
+  interval="$(prompt_interval_sec)"
+  day_length_secs="$eod_wait"
+  prompt_interval_secs="$interval"
   last_prompt_ts=""
+  paused="no"
+  pause_started_ts=""
+  paused_total_secs="0"
+  consecutive_same_count="0"
+  last_action=""
   save_state
 
-  start_prompt_loop_bg "$day_start_ts"
+  start_prompt_loop_bg "$day_start_ts" "$interval"
   start_eod_bg "$day_start_ts" "$eod_wait"
   save_state
 
@@ -662,7 +986,7 @@ run_start() {
     printf 'End-of-day scheduled for %s (in %s seconds)\n' "$end_at" "$eod_wait"
   fi
   if is_test_mode; then
-    printf 'TEST MODE: prompt interval=10s, day length=2m, meditation timer=15s\n'
+    printf 'TEST MODE: prompt interval=10s, day length=2m, meditation timer=15s, escalation break=10s\n'
   fi
 }
 
@@ -690,20 +1014,51 @@ status_line_pid() {
 
 run_status() {
   load_state
-  local now elapsed active
+  local now elapsed active active_elapsed remaining paused_total effective_pause_total
   now="$(date +%s)"
 
   if [[ -n "${day_start_ts:-}" ]]; then
     elapsed=$((now - day_start_ts))
+    if (( elapsed < 0 )); then
+      elapsed=0
+    fi
     active="yes"
+    active_elapsed="$(compute_active_elapsed_secs "$now")"
+    remaining="$(compute_remaining_secs "$now")"
+    paused_total="$(int_or_default "${paused_total_secs:-}" "0")"
+    effective_pause_total="$(effective_paused_total_secs "$now")"
     printf 'day_active: %s\n' "$active"
     printf 'start_time: %s\n' "$(date -r "$day_start_ts" +"%Y-%m-%d %H:%M:%S")"
     printf 'elapsed: %s\n' "$(format_elapsed "$elapsed")"
+    printf 'paused: %s\n' "${paused:-no}"
+    printf 'paused_total_secs: %s\n' "$paused_total"
+    if [[ "${paused:-no}" == "yes" ]]; then
+      printf 'pause_started_at: %s\n' "$(date -r "${pause_started_ts:-$now}" +"%Y-%m-%d %H:%M:%S")"
+      printf 'timers: paused\n'
+      printf 'effective_paused_total_secs: %s\n' "$effective_pause_total"
+    else
+      printf 'pause_started_at: <none>\n'
+    fi
+    printf 'active_elapsed_secs: %s\n' "$active_elapsed"
+    printf 'active_elapsed: %s\n' "$(format_elapsed "$active_elapsed")"
+    printf 'remaining_secs: %s\n' "$remaining"
+    printf 'remaining: %s\n' "$(format_elapsed "$remaining")"
+    printf 'day_length_secs: %s\n' "$(state_day_length_secs)"
+    printf 'prompt_interval_secs: %s\n' "$(state_prompt_interval_secs)"
   else
     active="no"
     printf 'day_active: %s\n' "$active"
     printf 'start_time: <none>\n'
     printf 'elapsed: 00h 00m 00s\n'
+    printf 'paused: no\n'
+    printf 'paused_total_secs: 0\n'
+    printf 'pause_started_at: <none>\n'
+    printf 'active_elapsed_secs: 0\n'
+    printf 'active_elapsed: 00h 00m 00s\n'
+    printf 'remaining_secs: 0\n'
+    printf 'remaining: 00h 00m 00s\n'
+    printf 'day_length_secs: %s\n' "$(state_day_length_secs)"
+    printf 'prompt_interval_secs: %s\n' "$(state_prompt_interval_secs)"
   fi
 
   status_line_pid "prompt_pid" "${prompt_pid:-}" "__prompt-loop"
@@ -722,6 +1077,8 @@ run_status() {
   else
     printf 'meditation_url_set: no\n'
   fi
+  printf 'consecutive_same_count: %s\n' "$(int_or_default "${consecutive_same_count:-}" "0")"
+  printf 'last_action: %s\n' "${last_action:-<none>}"
   printf 'state_file: %s\n' "$STATE_FILE"
   printf 'log_file: %s\n' "$LOG_FILE"
 }
@@ -776,6 +1133,81 @@ run_cancel() {
   save_state
   log_event "CANCEL" "cancel" "" "" ""
   printf 'Cancelled active jobs and cleared active day state.\n'
+}
+
+run_pause() {
+  load_state
+  local now=""
+  local active_elapsed=""
+
+  if [[ -z "${day_start_ts:-}" ]]; then
+    printf 'No active day to pause.\n'
+    return 0
+  fi
+
+  if [[ "${paused:-no}" == "yes" ]]; then
+    printf 'Day is already paused.\n'
+    return 0
+  fi
+
+  now="$(date +%s)"
+  active_elapsed="$(compute_active_elapsed_secs "$now")"
+  paused="yes"
+  pause_started_ts="$now"
+  cancel_jobs_in_memory
+  save_state
+  log_event "PAUSE" "pause" "$active_elapsed" "" ""
+
+  printf 'Paused active timers at %s.\n' "$(date -r "$now" +"%Y-%m-%d %H:%M:%S")"
+}
+
+run_resume() {
+  load_state
+  local now=""
+  local pause_started=0
+  local paused_total=0
+  local paused_delta=0
+  local remaining=0
+  local interval=0
+
+  if [[ -z "${day_start_ts:-}" ]]; then
+    printf 'No active day to resume.\n'
+    return 0
+  fi
+
+  if [[ "${paused:-no}" != "yes" ]]; then
+    printf 'Day is not paused.\n'
+    return 0
+  fi
+
+  now="$(date +%s)"
+  pause_started="$(int_or_default "${pause_started_ts:-}" "0")"
+  if (( pause_started > 0 && now > pause_started )); then
+    paused_delta=$((now - pause_started))
+  fi
+  paused_total="$(int_or_default "${paused_total_secs:-}" "0")"
+  paused_total_secs="$((paused_total + paused_delta))"
+  pause_started_ts=""
+  paused="no"
+
+  interval="$(state_prompt_interval_secs)"
+  remaining="$(compute_remaining_secs "$now")"
+  cancel_jobs_in_memory
+
+  if (( remaining <= 0 )); then
+    save_state
+    log_event "RESUME" "resume" "$paused_delta" "" ""
+    printf 'No remaining active work time; triggering shutdown.\n'
+    "$SCRIPT_PATH" __shutdown "auto" >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  start_prompt_loop_bg "$day_start_ts" "$interval"
+  start_eod_bg "$day_start_ts" "$remaining"
+  save_state
+  log_event "RESUME" "resume" "$paused_delta" "" ""
+
+  printf 'Resumed active timers. Remaining active time: %s.\n' "$(format_elapsed "$remaining")"
 }
 
 run_debug_prompt() {
@@ -896,6 +1328,8 @@ work_chill - personal work pacing helper
 
 Commands:
   work_chill start [--end-at HH:MM]
+  work_chill pause
+  work_chill resume
   work_chill status
   work_chill shutdown
   work_chill cancel
@@ -916,13 +1350,16 @@ Testing mode:
   - prompt interval: 10 seconds
   - day length: 2 minutes (unless --end-at is provided)
   - meditation timer: 15 seconds
+  - escalation break timer: 10 seconds
 EOF
 }
 
 run_prompt_loop() {
   local start_ts="${1:-}"
-  local interval
-  interval="$(prompt_interval_sec)"
+  local interval="${2:-}"
+  if [[ -z "$interval" ]]; then
+    interval="$(state_prompt_interval_secs)"
+  fi
 
   while true; do
     sleep "$interval"
@@ -960,6 +1397,8 @@ main() {
 
   case "$cmd" in
     start) run_start "$@" ;;
+    pause) run_pause ;;
+    resume) run_resume ;;
     status) run_status ;;
     shutdown) run_shutdown ;;
     cancel) run_cancel ;;
@@ -969,10 +1408,11 @@ main() {
     tail) run_tail ;;
     doctor) run_doctor ;;
     help|-h|--help) run_help ;;
-    __prompt-loop) run_prompt_loop "${1:-}" ;;
+    __prompt-loop) run_prompt_loop "${1:-}" "${2:-}" ;;
     __eod-wait) run_eod_wait "${1:-}" "${2:-}" ;;
     __shutdown) internal_shutdown "${1:-auto}" ;;
     __meditation-timer) run_meditation_timer "${1:-360}" ;;
+    __escalation-break-timer) run_escalation_break_timer "${1:-150}" ;;
     *)
       printf 'Unknown command: %s\n\n' "$cmd" >&2
       run_help

@@ -10,7 +10,8 @@ Personal macOS work pacing helper script.
 - Supports `pause` / `resume` so the day target is based on active work time
 - Triggers escalation on `stuck` and after 3 consecutive `same_as_last` responses
 - Supports manual and automatic shutdown flow
-- Logs events to JSONL at `~/.work_chill/log.jsonl`
+- Logs events to weekly JSONL files at `~/.work_chill/logs/YYYY-Www.jsonl` (ISO week)
+- Maintains `~/.work_chill/log.jsonl` as a symlink to the current week file for compatibility
 
 ## Script in this repo
 
@@ -41,6 +42,13 @@ work_chill cancel
 work_chill debug-prompt
 work_chill doctor
 ```
+
+## Data layout
+
+- State: `~/.work_chill/state.sh`
+- Weekly logs: `~/.work_chill/logs/YYYY-Www.jsonl`
+- Compatibility link: `~/.work_chill/log.jsonl` -> current weekly file
+- Background log: `~/.work_chill/bg.log`
 
 ## Quick reference (`chill`)
 

@@ -4,8 +4,12 @@ set -u
 
 DATA_DIR="${HOME}/.work_chill"
 STATE_FILE="${DATA_DIR}/state.sh"
-LOG_FILE="${DATA_DIR}/log.jsonl"
+LOGS_DIR="${DATA_DIR}/logs"
+LOG_FILE_LINK="${DATA_DIR}/log.jsonl"
+LOG_FILE="${LOG_FILE_LINK}"
+LEGACY_LOG_FILE="${LOGS_DIR}/legacy-log.jsonl"
 BG_LOG_FILE="${DATA_DIR}/bg.log"
+SHUTDOWN_LOOKBACK_WEEKS=8
 SCRIPT_PATH=""
 
 DEFAULT_MEDITATION_URL="https://youtu.be/7CaaHXjoRhA?si=LMDnR8tb5zmGMRV-"
@@ -207,6 +211,62 @@ iso_ts() {
   date -u +"%Y-%m-%dT%H:%M:%SZ"
 }
 
+current_iso_week() {
+  local week=""
+  week="$(date +%G-W%V 2>/dev/null || true)"
+  if [[ "$week" =~ ^[0-9]{4}-W[0-9]{2}$ ]]; then
+    printf '%s' "$week"
+  else
+    date +%Y-W%W
+  fi
+}
+
+current_week_log_file() {
+  printf '%s/%s.jsonl' "$LOGS_DIR" "$(current_iso_week)"
+}
+
+migrate_legacy_log_file_if_needed() {
+  [[ -e "$LOG_FILE_LINK" && ! -L "$LOG_FILE_LINK" ]] || return 0
+  [[ -f "$LOG_FILE_LINK" ]] || return 1
+
+  if [[ ! -e "$LEGACY_LOG_FILE" ]]; then
+    mv "$LOG_FILE_LINK" "$LEGACY_LOG_FILE"
+  else
+    cat "$LOG_FILE_LINK" >> "$LEGACY_LOG_FILE"
+    rm -f "$LOG_FILE_LINK"
+  fi
+  chmod 600 "$LEGACY_LOG_FILE" 2>/dev/null || true
+}
+
+sync_log_symlink() {
+  local weekly_log="${1:-}"
+  [[ -n "$weekly_log" ]] || return 1
+
+  if [[ -e "$LOG_FILE_LINK" && ! -L "$LOG_FILE_LINK" ]]; then
+    migrate_legacy_log_file_if_needed || true
+  fi
+
+  if [[ -L "$LOG_FILE_LINK" ]]; then
+    local current_target=""
+    current_target="$(readlink "$LOG_FILE_LINK" 2>/dev/null || true)"
+    if [[ "$current_target" != "$weekly_log" ]]; then
+      ln -sfn "$weekly_log" "$LOG_FILE_LINK"
+    fi
+  elif [[ ! -e "$LOG_FILE_LINK" ]]; then
+    ln -s "$weekly_log" "$LOG_FILE_LINK"
+  fi
+}
+
+refresh_log_targets() {
+  local weekly_log=""
+  mkdir -p "$LOGS_DIR"
+  weekly_log="$(current_week_log_file)"
+  LOG_FILE="$weekly_log"
+  touch "$LOG_FILE"
+  chmod 600 "$LOG_FILE" 2>/dev/null || true
+  sync_log_symlink "$LOG_FILE"
+}
+
 json_escape() {
   local s="${1:-}"
   s=${s//\\/\\\\}
@@ -218,9 +278,10 @@ json_escape() {
 }
 
 ensure_data_dir() {
-  mkdir -p "$DATA_DIR"
-  touch "$STATE_FILE" "$LOG_FILE" "$BG_LOG_FILE"
-  chmod 600 "$STATE_FILE" "$LOG_FILE" "$BG_LOG_FILE" 2>/dev/null || true
+  mkdir -p "$DATA_DIR" "$LOGS_DIR"
+  touch "$STATE_FILE" "$BG_LOG_FILE"
+  chmod 600 "$STATE_FILE" "$BG_LOG_FILE" 2>/dev/null || true
+  refresh_log_targets
 }
 
 save_state() {
@@ -685,18 +746,59 @@ extract_json_field_between() {
   printf '%s' "$value"
 }
 
-latest_shutdown_log_line() {
+latest_shutdown_line_in_file() {
+  local file="${1:-}"
   local line=""
-  [[ -f "$LOG_FILE" ]] || return 1
+  [[ -f "$file" ]] || return 1
 
-  line="$(tail -r "$LOG_FILE" 2>/dev/null | grep -m 1 '"event":"SHUTDOWN"' || true)"
+  line="$(tail -r "$file" 2>/dev/null | grep -m 1 '"event":"SHUTDOWN"' || true)"
   if [[ -z "$line" ]] && command -v tac >/dev/null 2>&1; then
-    line="$(tac "$LOG_FILE" 2>/dev/null | grep -m 1 '"event":"SHUTDOWN"' || true)"
+    line="$(tac "$file" 2>/dev/null | grep -m 1 '"event":"SHUTDOWN"' || true)"
   fi
   if [[ -z "$line" ]]; then
-    line="$(grep '"event":"SHUTDOWN"' "$LOG_FILE" 2>/dev/null | tail -n 1 || true)"
+    line="$(grep '"event":"SHUTDOWN"' "$file" 2>/dev/null | tail -n 1 || true)"
   fi
 
+  [[ -n "$line" ]] || return 1
+  printf '%s' "$line"
+}
+
+recent_previous_weekly_logs() {
+  local max_files="${1:-8}"
+  local count=0
+  local file=""
+  [[ -d "$LOGS_DIR" ]] || return 0
+
+  while IFS= read -r file; do
+    [[ "$file" == "$LOG_FILE" ]] && continue
+    [[ -f "$file" ]] || continue
+    printf '%s\n' "$file"
+    count=$((count + 1))
+    if (( count >= max_files )); then
+      break
+    fi
+  done < <(ls -1 "$LOGS_DIR"/????-W??.jsonl 2>/dev/null | sort -r)
+}
+
+latest_shutdown_log_line() {
+  local line=""
+  local file=""
+
+  line="$(latest_shutdown_line_in_file "$LOG_FILE" || true)"
+  if [[ -n "$line" ]]; then
+    printf '%s' "$line"
+    return 0
+  fi
+
+  while IFS= read -r file; do
+    line="$(latest_shutdown_line_in_file "$file" || true)"
+    if [[ -n "$line" ]]; then
+      printf '%s' "$line"
+      return 0
+    fi
+  done < <(recent_previous_weekly_logs "$SHUTDOWN_LOOKBACK_WEEKS")
+
+  line="$(latest_shutdown_line_in_file "$LEGACY_LOG_FILE" || true)"
   [[ -n "$line" ]] || return 1
   printf '%s' "$line"
 }
@@ -1304,6 +1406,13 @@ run_doctor() {
     failures=$((failures + 1))
   fi
 
+  if [[ -L "$LOG_FILE_LINK" ]]; then
+    printf '[ok] log symlink: %s -> %s\n' "$LOG_FILE_LINK" "$(readlink "$LOG_FILE_LINK" 2>/dev/null || true)"
+  else
+    printf '[fail] log symlink missing: %s\n' "$LOG_FILE_LINK"
+    failures=$((failures + 1))
+  fi
+
   if [[ -r "$STATE_FILE" ]]; then
     if bash -n "$STATE_FILE" >/dev/null 2>&1; then
       printf '[ok] state file syntax parseable\n'
@@ -1342,7 +1451,8 @@ Commands:
 
 State + logs:
   ~/.work_chill/state.sh
-  ~/.work_chill/log.jsonl
+  ~/.work_chill/logs/YYYY-Www.jsonl
+  ~/.work_chill/log.jsonl (symlink to current week)
   ~/.work_chill/bg.log
 
 Testing mode:

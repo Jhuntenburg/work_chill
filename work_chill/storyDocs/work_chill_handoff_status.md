@@ -1,6 +1,6 @@
 # Work Chill Handoff and Status
 
-Last updated: 2026-02-20 (America/New_York)
+Last updated: 2026-02-21 (America/New_York)
 
 ## Scope Completed
 
@@ -15,6 +15,7 @@ Implemented a low-friction macOS terminal workflow named `work_chill` with:
 - Escalation flow after 3 consecutive `same_as_last` responses and on `stuck`.
 - Guided shutdown ritual and meditation follow-up.
 - Local state/log persistence under `~/.work_chill`.
+- ISO-week log rotation (`Mon-Sun`) with compatibility symlink at `~/.work_chill/log.jsonl`.
 - Idempotent shell setup in `~/.zshrc` with aliases.
 - Health-check command: `work_chill doctor`.
 - Prompt diagnostics and recovery logging in background mode.
@@ -72,7 +73,10 @@ Confirmed lines:
   - `prompt_interval_secs`
   - `consecutive_same_count`
   - `last_action`
-- Event log: `/Users/joseph/.work_chill/log.jsonl`
+- Weekly log directory: `/Users/joseph/.work_chill/logs`
+- Current week event log: `/Users/joseph/.work_chill/logs/YYYY-Www.jsonl` (from `date +%G-W%V`)
+- Compatibility symlink: `/Users/joseph/.work_chill/log.jsonl` -> current weekly file
+- Legacy migrated file (one-time move when needed): `/Users/joseph/.work_chill/logs/legacy-log.jsonl`
 - Background log: `/Users/joseph/.work_chill/bg.log`
 
 ## Current Runtime Status (captured 2026-02-18)
@@ -138,7 +142,10 @@ Verified end-of-day clock-time scheduling:
 - `start --end-at HH:MM` uses local time; if the time has already passed today, it schedules for the next day.
 - `wdstart` remains an alias to `work_chill start` and accepts args, e.g. `wdstart --end-at 17:00`.
 - New startup context summary behavior:
-  - On `work_chill start`, before `DAY_START`, script reads `~/.work_chill/log.jsonl` and finds the most recent `SHUTDOWN`.
+  - On `work_chill start`, before `DAY_START`, script searches for latest `SHUTDOWN` in this order:
+    - current week file (`~/.work_chill/logs/YYYY-Www.jsonl`)
+    - previous weekly files (most recent 8 max)
+    - `~/.work_chill/logs/legacy-log.jsonl` fallback
   - Extracted fields: `task_text`, `tomorrow_first_step`, `open_items`, `ts`.
   - Dialog title: `Welcome back`.
   - Message sections are shown only when each field is non-empty:
@@ -277,6 +284,61 @@ Observed:
     - `remaining_secs: 93`
     - live `prompt_pid` and `eod_pid`
 
+## 2026-02-21 Weekly Log Rotation Upgrade
+
+Implemented requested weekly log behavior in `/Users/joseph/hss_docker/work_chill/work_chill` with minimal, bash-only changes.
+
+### What Changed
+
+- Added ISO-week log target resolution per invocation:
+  - uses `date +%G-W%V`
+  - weekly file format: `~/.work_chill/logs/YYYY-Www.jsonl`
+- Added `~/.work_chill/logs` auto-creation.
+- Added backward-compat symlink management:
+  - `~/.work_chill/log.jsonl` is now maintained as a symlink to current week file.
+  - if a real file exists at `~/.work_chill/log.jsonl`, it is migrated once to `~/.work_chill/logs/legacy-log.jsonl` (append-safe when legacy already exists), then symlink is created.
+- All log writes now go to weekly `LOG_FILE`.
+- `work_chill tail` now tails current weekly log (via resolved `LOG_FILE`).
+- `work_chill status` now prints current weekly path in `log_file:`.
+- Welcome-back SHUTDOWN lookup now scans:
+  - current week first,
+  - then up to 8 most recent prior weekly logs,
+  - then `legacy-log.jsonl` fallback.
+- `work_chill doctor` now verifies the compatibility symlink.
+
+### Validation Run (2026-02-21)
+
+Executed sequence:
+
+1. `work_chill doctor`
+2. `work_chill status`
+3. `WORK_CHILL_TEST=1 work_chill start`
+4. `work_chill status`
+5. `ls -la ~/.work_chill/logs | tail`
+6. `readlink ~/.work_chill/log.jsonl`
+7. `tail -n 5 ~/.work_chill/logs/$(date +%G-W%V).jsonl`
+8. `work_chill cancel` (cleanup)
+
+Observed:
+
+- `doctor_result: healthy`
+- Doctor confirms weekly file and symlink:
+  - `[ok] log file writable: /Users/joseph/.work_chill/logs/2026-W08.jsonl`
+  - `[ok] log symlink: /Users/joseph/.work_chill/log.jsonl -> /Users/joseph/.work_chill/logs/2026-W08.jsonl`
+- `status` confirms:
+  - `log_file: /Users/joseph/.work_chill/logs/2026-W08.jsonl`
+- Logs directory proof:
+  - `2026-W08.jsonl`
+  - `legacy-log.jsonl`
+- Symlink proof:
+  - `readlink ~/.work_chill/log.jsonl` => `/Users/joseph/.work_chill/logs/2026-W08.jsonl`
+- Last 5 log lines from current week file:
+  - `{"ts":"2026-02-21T15:59:10Z","event":"CANCEL","action":"cancel"}`
+  - `{"ts":"2026-02-21T16:01:16Z","event":"DAY_START","action":"start","day_start_ts":"1771689676"}`
+  - `{"ts":"2026-02-21T16:01:16Z","event":"TASK_PULSE_SKIPPED","action":"skip","day_start_ts":"1771689676"}`
+  - `{"ts":"2026-02-21T16:01:21Z","event":"TASK_PULSE","action":"new_task","task_text":"","day_start_ts":"1771689676"}`
+  - `{"ts":"2026-02-21T16:01:26Z","event":"TASK_PULSE","action":"same_as_last","task_text":"","day_start_ts":"1771689676"}`
+
 ## Usage Quickstart
 
 1. `source ~/.zshrc`
@@ -294,6 +356,10 @@ bash -n /Users/joseph/hss_docker/work_chill/work_chill
 work_chill doctor
 work_chill status
 tail -n 20 /Users/joseph/.work_chill/log.jsonl
+readlink /Users/joseph/.work_chill/log.jsonl
+current_week="$(date +%G-W%V)"
+ls -la /Users/joseph/.work_chill/logs | tail
+tail -n 20 "/Users/joseph/.work_chill/logs/${current_week}.jsonl"
 tail -n 20 /Users/joseph/.work_chill/bg.log
 ```
 
